@@ -40,13 +40,71 @@ def test_example_is_optimal_and_matches_documented_response():
 
     p1, p2 = r.timeline
     assert (p1.start, p1.end, p1.peak_bytes) == (0, 5, 64)
-    assert (p2.start, p2.end, p2.peak_bytes) == (5, 12, 96)
-    # mutually exclusive paths are serialized
-    assert p1.end <= p2.start
+    assert (p2.start, p2.end, p2.peak_bytes) == (0, 7, 96)
+    # mutually exclusive paths are planned independently: each meets the
+    # deadline on its own and their timelines may overlap
+    assert p2.start < p1.end
+
+
+def test_mutually_exclusive_paths_overlap_and_reuse_addresses():
+    # Each path finishes in 7 < deadline 8, but serialized they would need
+    # 14: the planner must not serialize mutually-exclusive paths.
+    r = _plan({
+        "deadline": 8, "memory_limit": 256,
+        "paths": [
+            {"id": "A",
+             "operators": [{"id": "a", "duration": 4},
+                           {"id": "b", "duration": 3, "depends_on": ["a"]}],
+             "tensors": [{"id": "u", "bytes": 64, "alignment": 16,
+                          "producer": "a", "consumers": ["b"]}]},
+            {"id": "B",
+             "operators": [{"id": "a", "duration": 4},
+                           {"id": "b", "duration": 3, "depends_on": ["a"]}],
+             "tensors": [{"id": "v", "bytes": 64, "alignment": 16,
+                          "producer": "a", "consumers": ["b"]}]},
+        ],
+    })
+    assert r.feasible and r.optimal
+    pa, pb = r.timeline
+    assert (pa.start, pa.end) == (0, 7) and (pb.start, pb.end) == (0, 7)
+    # overlapping timelines still share the global buffer: u and v are never
+    # live in the same path, so they reuse the same address
+    addr = {a.tensor_id: a.address for a in r.addresses}
+    assert addr["u"] == addr["v"] == 0
+    assert r.capacity_upper_bound == 64
+
+
+def test_overlapping_paths_still_protect_same_path_lifetimes():
+    # Timelines overlap, but tensors simultaneously live in the SAME path
+    # must still get disjoint bytes.
+    r = _plan({
+        "deadline": 6, "memory_limit": 256,
+        "paths": [
+            {"id": "A",
+             "operators": [{"id": "a", "duration": 2},
+                           {"id": "b", "duration": 2, "depends_on": ["a"]}],
+             "tensors": [
+                 {"id": "u", "bytes": 64, "alignment": 16, "producer": "a",
+                  "consumers": ["b"]},
+                 {"id": "w", "bytes": 64, "alignment": 16, "producer": "a",
+                  "consumers": ["b"]},
+             ]},
+            {"id": "B",
+             "operators": [{"id": "a", "duration": 3}],
+             "tensors": [{"id": "v", "bytes": 128, "alignment": 16,
+                          "producer": "a", "consumers": []}]},
+        ],
+    })
+    assert r.feasible and r.optimal
+    addr = {a.tensor_id: a.address for a in r.addresses}
+    # u and w are co-live in A -> disjoint; v (path B) may reuse their bytes
+    assert {addr["u"], addr["w"]} == {0, 64}
+    assert addr["v"] == 0
+    assert r.capacity_upper_bound == 128
 
 
 def test_deadline_infeasible():
-    p = _load_example(); p["deadline"] = 11
+    p = _load_example(); p["deadline"] = 6  # P2 alone needs 7
     r = _plan(PlanRequest.model_validate(p))
     assert not r.feasible and r.reason == "deadline"
 
@@ -58,7 +116,7 @@ def test_memory_infeasible():
 
 
 def test_both_infeasible():
-    p = _load_example(); p["deadline"] = 11; p["memory_limit"] = 64
+    p = _load_example(); p["deadline"] = 6; p["memory_limit"] = 64
     r = _plan(PlanRequest.model_validate(p))
     assert not r.feasible and r.reason == "deadline_and_memory_limit"
 
@@ -155,6 +213,8 @@ def test_cross_path_reuse():
     addr = {a.tensor_id: a.address for a in r.addresses}
     assert addr["u"] == addr["v"] == 0
     assert r.capacity_upper_bound == 64
+    # both paths start at 0: no artificial serialization
+    assert all(p.start == 0 for p in r.timeline)
 
 
 def test_inconsistent_same_name_tensor_rejected():

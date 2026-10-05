@@ -32,7 +32,7 @@ def test_plan_matches_documented_example():
 
 
 def test_infeasible_deadline():
-    p = json.loads(json.dumps(EXAMPLE)); p["deadline"] = 11
+    p = json.loads(json.dumps(EXAMPLE)); p["deadline"] = 6  # P2 alone needs 7
     r = client.post("/plans", json=p)
     assert r.status_code == 200
     assert r.json()["feasible"] is False and r.json()["reason"] == "deadline"
