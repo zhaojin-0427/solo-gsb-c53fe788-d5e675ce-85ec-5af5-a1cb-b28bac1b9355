@@ -40,14 +40,87 @@ def test_example_is_optimal_and_matches_documented_response():
 
     p1, p2 = r.timeline
     assert (p1.start, p1.end, p1.peak_bytes) == (0, 5, 64)
-    assert (p2.start, p2.end, p2.peak_bytes) == (5, 12, 96)
-    # mutually exclusive paths are serialized
-    assert p1.end <= p2.start
+    assert (p2.start, p2.end, p2.peak_bytes) == (0, 7, 96)
+    # mutually exclusive paths are not serialized: their timelines overlap
+    assert p1.start == p2.start == 0
+
+
+def test_mutex_paths_meet_deadline_independently():
+    # each path fits the deadline (5 and 7) but their serialized total (12)
+    # does not; the old model wrongly reported infeasibility
+    p = _load_example(); p["deadline"] = 8
+    r = _plan(p)
+    assert r.feasible and r.optimal
+    for ps in r.timeline:
+        assert ps.start == 0 and ps.end <= 8
+    # timelines genuinely overlap
+    ends = [ps.end for ps in r.timeline]
+    assert max(ends) <= 8 < sum(ends)
+    # global buffer is still shared across paths
+    by_id = {a.tensor_id: a.address for a in r.addresses}
+    assert by_id["x"] == by_id["y"] == 0
+
+
+def test_overlapping_live_rects_alias_across_mutex_paths():
+    # two 64-byte roots are live over the very same window [2, 4) in two
+    # mutually-exclusive paths; the deadline (4) forces the timelines to
+    # overlap and the memory limit (64) forces address reuse. A single global
+    # NoOverlap2D would reject this; per-path constraints permit it.
+    r = _plan({
+        "deadline": 4, "memory_limit": 64,
+        "paths": [
+            {"id": "A",
+             "operators": [{"id": "a", "duration": 2},
+                           {"id": "b", "duration": 2, "depends_on": ["a"]}],
+             "tensors": [{"id": "u", "bytes": 64, "alignment": 16,
+                          "producer": "a", "consumers": ["b"]}]},
+            {"id": "B",
+             "operators": [{"id": "c", "duration": 2},
+                           {"id": "d", "duration": 2, "depends_on": ["c"]}],
+             "tensors": [{"id": "v", "bytes": 64, "alignment": 16,
+                          "producer": "c", "consumers": ["d"]}]},
+        ],
+    })
+    assert r.feasible and r.optimal
+    assert r.capacity_upper_bound == 64
+    addr = {a.tensor_id: a.address for a in r.addresses}
+    assert addr["u"] == addr["v"] == 0
+    pa, pb = r.timeline
+    assert pa.start == pb.start == 0 and pa.end == pb.end == 4
+
+
+def test_same_path_overlap_still_forced_apart():
+    # roots live at the same time within ONE path must still be disjoint,
+    # even though their addresses could be reused on another path
+    r = _plan({
+        "deadline": 4, "memory_limit": 256,
+        "paths": [
+            {"id": "A",
+             "operators": [{"id": "a", "duration": 2},
+                           {"id": "b", "duration": 2, "depends_on": ["a"]}],
+             "tensors": [{"id": "u", "bytes": 64, "alignment": 16,
+                          "producer": "a", "consumers": ["b"]}]},
+            {"id": "B",
+             "operators": [{"id": "c", "duration": 2},
+                           {"id": "d", "duration": 2, "depends_on": ["c"]}],
+             "tensors": [
+                 {"id": "v", "bytes": 64, "alignment": 16,
+                  "producer": "c", "consumers": ["d"]},
+                 {"id": "w", "bytes": 48, "alignment": 16,
+                  "producer": "c", "consumers": ["d"]}]},
+        ],
+    })
+    assert r.feasible and r.optimal
+    addr = {a.tensor_id: a.address for a in r.addresses}
+    assert addr["u"] == addr["v"] == 0
+    assert addr["w"] == 64  # cannot alias v inside the same path
+    assert r.capacity_upper_bound == 112
 
 
 def test_deadline_infeasible():
-    p = _load_example(); p["deadline"] = 11
-    r = _plan(PlanRequest.model_validate(p))
+    # P2 alone needs 7 time units; 6 is impossible even without serialization
+    p = _load_example(); p["deadline"] = 6
+    r = _plan(p)
     assert not r.feasible and r.reason == "deadline"
 
 
@@ -58,8 +131,8 @@ def test_memory_infeasible():
 
 
 def test_both_infeasible():
-    p = _load_example(); p["deadline"] = 11; p["memory_limit"] = 64
-    r = _plan(PlanRequest.model_validate(p))
+    p = _load_example(); p["deadline"] = 6; p["memory_limit"] = 64
+    r = _plan(p)
     assert not r.feasible and r.reason == "deadline_and_memory_limit"
 
 
@@ -259,6 +332,35 @@ def test_view_can_share_base_producer_operator():
     assert r.feasible
     addr = {t.tensor_id: t.address for t in r.addresses}
     assert addr["a"] == addr["z"]
+
+
+def test_capacity_and_lex_optimum_with_alignment_gaps():
+    # g(30B, align32) and h(16B, align16) coexist in path A; k(40B, align32)
+    # is alone in path B with an overlapping window. Capacity must still be
+    # proved optimal and addresses lexicographically minimal across paths.
+    r = _plan({
+        "deadline": 10, "memory_limit": 4096,
+        "paths": [
+            {"id": "A",
+             "operators": [{"id": "a", "duration": 2},
+                           {"id": "b", "duration": 2, "depends_on": ["a"]}],
+             "tensors": [
+                 {"id": "g", "bytes": 30, "alignment": 32,
+                  "producer": "a", "consumers": ["b"]},
+                 {"id": "h", "bytes": 16, "alignment": 16,
+                  "producer": "a", "consumers": ["b"]}]},
+            {"id": "B",
+             "operators": [{"id": "c", "duration": 8}],
+             "tensors": [
+                 {"id": "k", "bytes": 40, "alignment": 32,
+                  "producer": "c", "output": True}]},
+        ],
+    })
+    assert r.feasible and r.optimal
+    addr = {a.tensor_id: a.address for a in r.addresses}
+    # g@0, h forced apart from g within A -> 32; k aliases g across paths
+    assert addr == {"g": 0, "h": 32, "k": 0}
+    assert r.capacity_upper_bound == 48
 
 
 def test_address_tiebreak_uses_smallest_tensor_id_of_root():

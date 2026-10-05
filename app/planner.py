@@ -3,11 +3,15 @@
 The planner jointly solves:
 
 * a non-preemptive schedule of each path's operator DAG (ready operators may
-  run in parallel), with mutually-exclusive paths serialized on one global
-  timeline and every path finishing before the deadline;
+  run in parallel). Every mutually-exclusive path runs on its own timeline
+  anchored at 0 and only has to finish before the deadline itself; the paths
+  are *not* serialized, so their timelines may overlap (at run time only one
+  path executes);
 * placement of every root tensor in one shared byte-addressable buffer under
-  power-of-two alignment, where tensors that are never simultaneously live in
-  a path may share bytes and mutually-exclusive paths may reuse them.
+  power-of-two alignment, where roots that are never simultaneously live
+  within the same path may share bytes. Roots of different paths may always
+  alias -- even when their liveness windows overlap in time -- because the
+  paths are mutually exclusive.
 
 Optimization is strictly lexicographic:
 
@@ -298,21 +302,19 @@ def build_model(prep: Prepared, deadline: int, memory_limit: int) -> ModelArtifa
                 if bp != oc.producer:
                     m.Add(s[(pid, oc.producer)] >= f[(pid, bp)])
 
-    # path windows; mutually-exclusive paths are serialized on the timeline
-    sp, ep, path_ivs = {}, {}, []
+    # path windows: each mutually-exclusive path runs on its own timeline and
+    # only has to finish before the deadline; paths are NOT serialized, so
+    # their windows may overlap. Every operator starts at >= 0 and the
+    # lexicographic tie-break later pins each path start to 0 (ASAP).
+    sp, ep = {}, {}
     for pid in prep.path_ids:
         op_ids = list(prep.path_ops[pid])
         sv = m.NewIntVar(0, H, f"S_{pid}")
         ev = m.NewIntVar(0, H, f"E_{pid}")
-        dur = m.NewIntVar(0, H, f"D_{pid}")
         m.AddMaxEquality(ev, [f[(pid, o)] for o in op_ids])
         m.AddMinEquality(sv, [s[(pid, o)] for o in op_ids])
-        m.Add(dur == ev - sv)
-        iv = m.NewIntervalVar(sv, dur, ev, f"iv_{pid}")
-        path_ivs.append(iv)
         m.Add(ev <= deadline)
         sp[pid], ep[pid] = sv, ev
-    m.AddNoOverlap(path_ivs)
 
     # root tensor addresses in the shared buffer
     addr: dict = {}
@@ -335,20 +337,24 @@ def build_model(prep: Prepared, deadline: int, memory_limit: int) -> ModelArtifa
     m.Add(cap <= memory_limit)
 
     # liveness intervals of roots within each path; each non-empty lifetime
-    # becomes a (time x bytes) rectangle. AddNoOverlap2D enforces, in one
-    # constraint, that simultaneously-live roots (in any paths) are disjoint
-    # in bytes and that every rectangle stays inside the global capacity.
+    # becomes a (time x bytes) rectangle. A separate AddNoOverlap2D per path
+    # enforces that roots simultaneously live *within the same path* are
+    # disjoint in bytes. Rectangles of different (mutually-exclusive) paths
+    # are deliberately grouped apart: their timelines may overlap, yet they
+    # may alias the same bytes since only one path ever runs. Each shared
+    # address interval is constrained by ``a + size <= cap`` above, which
+    # bounds the single global buffer independently of this constraint.
     lstart: dict = {}
     lend: dict = {}
     presence: dict = {}
-    x_rects: list = []
-    y_rects: list = []
 
     for pid in prep.path_ids:
         members: dict[str, list[TInfo]] = {}
         for info in prep.tensors.values():
             if pid in info.occ:
                 members.setdefault(info.root, []).append(info)
+        x_rects: list = []
+        y_rects: list = []
         for r, infos in members.items():
             starts, ends = [], []
             for info in infos:
@@ -385,7 +391,8 @@ def build_model(prep: Prepared, deadline: int, memory_limit: int) -> ModelArtifa
                 x_rects.append(iv)
                 y_rects.append(y_iv[r])
 
-    m.AddNoOverlap2D(x_rects, y_rects)
+        if x_rects:
+            m.AddNoOverlap2D(x_rects, y_rects)
 
     return ModelArtifacts(m, s, f, sp, ep, addr, cap, lstart, lend, presence)
 
@@ -563,8 +570,8 @@ def _path_peak(
 
 def _infeasible_response(prep: Prepared, req: PlanRequest) -> PlanResponse:
     # Relax one resource at a time using its guaranteed-sufficient bound:
-    # S = sum of all live root sizes always fits memory; H = total work
-    # always fits the serialized timeline.
+    # S = sum of all live root sizes always fits memory; H = total work over
+    # all paths dominates every path's own length, so deadline H always fits.
     deadline_ok = _feasible(prep, req.deadline, prep.S)
     memory_ok = _feasible(prep, prep.H, req.memory_limit)
     if not deadline_ok and not memory_ok:
